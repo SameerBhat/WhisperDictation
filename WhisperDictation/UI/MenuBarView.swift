@@ -7,6 +7,7 @@ struct MenuBarView: View {
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var modelManager = ModelManager.shared
     @Environment(\.openWindow) private var openWindow
+    @State private var justCopied = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -157,29 +158,46 @@ struct MenuBarView: View {
                     .foregroundStyle(.tertiary)
                 Spacer()
                 // Copy the last transcription to the clipboard (local tweak)
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(engine.lastTranscription, forType: .string)
-                } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
-                        .font(.system(size: 11))
+                Button(action: copyLastTranscription) {
+                    Label(justCopied ? "Copied" : "Copy",
+                          systemImage: justCopied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 11, weight: .medium))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
+                .buttonStyle(CopyButtonStyle(copied: justCopied))
                 .help("Copy the last transcription")
             }
 
-            Text(engine.lastTranscription)
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(10)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(.quaternary.opacity(0.5))
-                )
+            // Clicking the text copies it too
+            Button(action: copyLastTranscription) {
+                Text(engine.lastTranscription)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(.quaternary.opacity(0.5))
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Click to copy")
         }
+    }
+
+    private func copyLastTranscription() {
+        let text = engine.lastTranscription
+        guard !text.isEmpty else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        justCopied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { justCopied = false }
     }
 
     // MARK: - Status Helpers
@@ -265,6 +283,20 @@ private struct AlertRow: View {
             )
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Copy Button (local tweak)
+
+private struct CopyButtonStyle: ButtonStyle {
+    let copied: Bool
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(copied ? Color.green : (configuration.isPressed ? Color.white : Color.secondary))
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(configuration.isPressed ? Color.blue.opacity(0.8) : Color.primary.opacity(0.06))
+            )
     }
 }
 
