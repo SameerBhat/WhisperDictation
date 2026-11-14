@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct MenuBarView: View {
     let engine: DictationEngine
@@ -148,11 +149,25 @@ struct MenuBarView: View {
 
     private var transcriptionSection: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Last transcription")
-                .font(.system(size: 9, weight: .semibold))
-                .textCase(.uppercase)
-                .tracking(0.3)
-                .foregroundStyle(.tertiary)
+            HStack {
+                Text("Last transcription")
+                    .font(.system(size: 9, weight: .semibold))
+                    .textCase(.uppercase)
+                    .tracking(0.3)
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                // Copy the last transcription to the clipboard (local tweak)
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(engine.lastTranscription, forType: .string)
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Copy the last transcription")
+            }
 
             Text(engine.lastTranscription)
                 .font(.system(size: 12))
