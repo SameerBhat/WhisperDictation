@@ -33,7 +33,7 @@ SWIFT_FILES := \
 LIBS := -lwhisper -lggml -lggml-base -lggml-cpu -lggml-metal -lggml-blas -lc++
 FRAMEWORKS := -framework Accelerate -framework Metal -framework MetalKit -framework AVFoundation -framework CoreGraphics -framework AppKit -framework Foundation -framework ServiceManagement -framework CoreAudio -framework AudioToolbox
 
-.PHONY: all clean whisper model app run dmg
+.PHONY: all clean whisper model app run dmg install
 
 all: whisper app
 
@@ -92,6 +92,18 @@ app: $(BUILD_DIR)/WhisperDictation
 
 run: app
 	open "$(APP_BUNDLE)"
+
+# Build straight into /Applications (no second copy for Spotlight to find):
+# quit the running app, assemble the bundle in place, relaunch it.
+# Rebuilding changes the ad-hoc signature, so macOS asks for Accessibility /
+# Input Monitoring again afterwards.
+INSTALL_DIR := /Applications
+install: $(BUILD_DIR)/WhisperDictation
+	@osascript -e 'tell application id "com.sampop.WhisperDictation" to quit' 2>/dev/null || true
+	@for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x WhisperDictation >/dev/null || break; sleep 1; done
+	@pgrep -x WhisperDictation >/dev/null && { echo "WhisperDictation is still running (frozen?). Force-quit it and re-run make install."; exit 1; } || true
+	@$(MAKE) --no-print-directory app APP_BUNDLE="$(INSTALL_DIR)/WhisperDictation.app"
+	open "$(INSTALL_DIR)/WhisperDictation.app"
 
 dmg: app
 	./scripts/create-dmg.sh
