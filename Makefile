@@ -12,6 +12,7 @@ SWIFT_FILES := \
 	WhisperDictation/Utilities/Settings.swift \
 	WhisperDictation/Utilities/KeyCodeNames.swift \
 	WhisperDictation/Utilities/AppInfo.swift \
+	WhisperDictation/Utilities/Diagnostics.swift \
 	WhisperDictation/Engine/WhisperBridge.swift \
 	WhisperDictation/Engine/AudioCapture.swift \
 	WhisperDictation/Engine/TextInjector.swift \

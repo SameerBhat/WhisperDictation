@@ -41,6 +41,7 @@ final class DictationEngine {
     private var holdWorkItem: DispatchWorkItem?
 
     init() {
+        Diagnostics.start()
         let axTrusted = AXIsProcessTrusted()
         fputs("[DictationEngine] Init. Accessibility: \(axTrusted)\n", stderr)
         audioCapture.onConfigurationChange = { [weak self] in
@@ -377,6 +378,34 @@ final class DictationEngine {
             } else {
                 returnToIdle()
             }
+            if case AudioCaptureError.audioSystemNotResponding = error {
+                relaunchAfterStuckAudio()
+            }
+        }
+    }
+
+    /// A start that timed out leaves a thread spinning inside AVAudioEngine
+    /// (observed: `-[AVAudioEngine inputNode]` → `_GetHWFormat` polling the HAL
+    /// forever for its private aggregate device after the device switch failed,
+    /// holding the engine mutex and ~40% CPU). A thread can't be cancelled, so do
+    /// automatically what a force-quit did by hand: restart the app. The app stays
+    /// responsive meanwhile; the next dictation works after the ~2 s relaunch.
+    private func relaunchAfterStuckAudio() {
+        fputs("[DictationEngine] Audio engine stuck — relaunching the app\n", stderr)
+        let relauncher = Process()
+        relauncher.executableURL = URL(fileURLWithPath: "/bin/sh")
+        relauncher.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", Bundle.main.bundlePath]
+        do {
+            try relauncher.run()
+        } catch {
+            fputs("[DictationEngine] Could not schedule relaunch: \(error)\n", stderr)
+            return
+        }
+        // Backstop: if the normal terminate path also wedges on the stuck engine
+        // (exit-time teardown), leave without running exit handlers.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { _exit(0) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            NSApp.terminate(nil)
         }
     }
 

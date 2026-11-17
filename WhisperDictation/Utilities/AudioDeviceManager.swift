@@ -35,10 +35,14 @@ final class AudioDeviceManager: ObservableObject, @unchecked Sendable {
     /// input and output as one IO unit, so a stalled default output (a sleeping
     /// DisplayPort monitor) hung engine.start() ~10 s and failed it; the same mic
     /// set explicitly started in ~0.25 s.
-    func applySelectedDevice(to engine: AVAudioEngine) {
+    ///
+    /// Called on AudioCapture's worker queue, never the main thread (CoreAudio can
+    /// block here indefinitely), so it takes a main-thread snapshot of the selection
+    /// and device list instead of reading AppSettings / `inputDevices` itself.
+    static func applySelectedDevice(to engine: AVAudioEngine, selectedUID: String?, devices: [AudioInputDevice]) {
         guard var deviceID = Self.resolveInputDevice(
-            selectedUID: AppSettings.shared.selectedAudioDeviceUID,
-            devices: inputDevices,
+            selectedUID: selectedUID,
+            devices: devices,
             systemDefault: Self.systemDefaultInputDevice()
         ) else { return }
 

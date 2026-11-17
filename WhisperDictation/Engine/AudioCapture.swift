@@ -1,9 +1,36 @@
 import AVFoundation
 
 final class AudioCapture {
-    private var audioEngine: AVAudioEngine?
+    /// Every AVAudioEngine call (create, select device, prepare, tap, start, stop)
+    /// runs on this worker, never on the main thread. CoreAudio can block forever
+    /// inside engine setup: creating the input node makes AVAudioEngine move the
+    /// AUHAL to its private default-device aggregate on an internal thread, and when
+    /// that races with our explicit device selection the internal switch fails
+    /// ('nope', "listener was already added") and the selecting thread never
+    /// returns. On the main thread that froze the whole app (hotkey tap, menu bar)
+    /// until it was force-killed. Now the main thread waits at most
+    /// `startTimeout`; a stuck worker is abandoned and the next recording gets a
+    /// fresh one. Main-thread only (written by start/stop, both called on main).
+    private var worker = AudioCapture.makeWorker()
+
+    private static func makeWorker() -> DispatchQueue {
+        DispatchQueue(label: "com.whisperdictation.audio-capture", qos: .userInitiated)
+    }
+
+    /// How long the main thread waits for the engine to start before giving up.
+    /// A healthy start takes ~50–250 ms.
+    static let startTimeout: TimeInterval = 3
+
     private var audioBuffer: [Float] = []
     private let bufferLock = NSLock()
+
+    // Guarded by bufferLock. Each start bumps `sessionGeneration`; stop and an
+    // abandoned start bump it again. Tap callbacks, config notifications and a
+    // late-finishing start from an abandoned worker compare against it, so a
+    // stale engine can never feed or stop the current session.
+    private var sessionGeneration = 0
+    private var activeEngine: AVAudioEngine?
+    private var activeObserver: NSObjectProtocol?
 
     /// Invoked when the audio engine's configuration changes while recording
     /// (e.g. the selected input device is unplugged). Called on an arbitrary
@@ -26,7 +53,6 @@ final class AudioCapture {
         set { bufferLock.lock(); _onSamples = newValue; bufferLock.unlock() }
     }
     private var _onSamples: (([Float]) -> Void)?
-    private var configObserver: NSObjectProtocol?
 
     private static let sampleRate: Double = 16000
 
@@ -62,13 +88,65 @@ final class AudioCapture {
         interleaved: false
     )!
 
+    /// Starts capture on the worker and waits (bounded) for it. Main thread only.
     func startRecording() throws {
+        // Snapshot main-thread state for the worker.
+        let selectedUID = AppSettings.shared.selectedAudioDeviceUID
+        let devices = AudioDeviceManager.shared.inputDevices
+
+        bufferLock.lock()
+        sessionGeneration += 1
+        let generation = sessionGeneration
+        audioBuffer.removeAll(keepingCapacity: true)
+        // Pre-size for ~60s of 16kHz mono Float32 to avoid repeated reallocation of
+        // the hot append path. The buffer still grows if a session runs longer (up to
+        // the 5-minute cap enforced in the tap).
+        audioBuffer.reserveCapacity(Int(Self.sampleRate) * 60)
+        bufferLock.unlock()
+
+        let outcome = StartOutcome()
+        let done = DispatchSemaphore(value: 0)
+        worker.async {
+            do {
+                try self.startOnWorker(generation: generation, selectedUID: selectedUID, devices: devices)
+            } catch {
+                outcome.error = error
+            }
+            done.signal()
+        }
+
+        if done.wait(timeout: .now() + Self.startTimeout) == .timedOut {
+            fputs("[AudioCapture] Engine start did not return within \(Self.startTimeout)s — CoreAudio is stuck; abandoning that worker\n", stderr)
+            bufferLock.lock()
+            if sessionGeneration == generation { sessionGeneration += 1 }
+            bufferLock.unlock()
+            worker = Self.makeWorker()
+            throw AudioCaptureError.audioSystemNotResponding
+        }
+        if let error = outcome.error { throw error }
+        fputs("[AudioCapture] Recording started\n", stderr)
+    }
+
+    /// Box for the worker's start result. Written on the worker before
+    /// `done.signal()` and read on main only after a successful wait, so the
+    /// semaphore orders the accesses; after a timeout main never reads it.
+    private final class StartOutcome: @unchecked Sendable {
+        var error: Error?
+    }
+
+    private func isCurrent(_ generation: Int) -> Bool {
+        bufferLock.lock(); defer { bufferLock.unlock() }
+        return sessionGeneration == generation
+    }
+
+    /// Worker only.
+    private func startOnWorker(generation: Int, selectedUID: String?, devices: [AudioInputDevice]) throws {
         let engine = AVAudioEngine()
 
         // Apply the user-selected input device BEFORE prepare()/reading the format,
         // so the hardware format reflects the chosen device. Failure falls back to
         // the system default device (logged inside applySelectedDevice).
-        AudioDeviceManager.shared.applySelectedDevice(to: engine)
+        AudioDeviceManager.applySelectedDevice(to: engine, selectedUID: selectedUID, devices: devices)
 
         let inputNode = engine.inputNode
 
@@ -91,14 +169,6 @@ final class AudioCapture {
             fputs("[AudioCapture] Could not create converter from hardware format\n", stderr)
             throw AudioCaptureError.invalidFormat
         }
-
-        bufferLock.lock()
-        audioBuffer.removeAll(keepingCapacity: true)
-        // Pre-size for ~60s of 16kHz mono Float32 to avoid repeated reallocation of
-        // the hot append path. The buffer still grows if a session runs longer (up to
-        // the 5-minute cap enforced below).
-        audioBuffer.reserveCapacity(Int(Self.sampleRate) * 60)
-        bufferLock.unlock()
 
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: hwFormat) { [weak self] buffer, _ in
             #if DEBUG
@@ -144,6 +214,12 @@ final class AudioCapture {
             if converted.frameLength > 0, let data = converted.floatChannelData {
                 let samples = Array(UnsafeBufferPointer(start: data[0], count: Int(converted.frameLength)))
                 self.bufferLock.lock()
+                // A stale engine (stopped or abandoned session) still draining its
+                // last buffers must not leak into the current session.
+                guard self.sessionGeneration == generation else {
+                    self.bufferLock.unlock()
+                    return
+                }
                 let previousCount = self.audioBuffer.count
                 self.audioBuffer.append(contentsOf: samples)
                 let crossedCap = Self.crossesDurationCap(previousCount: previousCount, newCount: self.audioBuffer.count)
@@ -164,13 +240,13 @@ final class AudioCapture {
 
         // Detect audio configuration changes mid-recording (device unplugged, a new
         // default device appearing, sample-rate change — all invalidate the tap).
-        // Observe this specific engine only. Removed in stopRecording().
-        configObserver = NotificationCenter.default.addObserver(
+        // Observe this specific engine only. Removed when the session is torn down.
+        let observer = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: engine,
             queue: nil
         ) { [weak self, weak engine] _ in
-            guard let self else { return }
+            guard let self, self.isCurrent(generation) else { return }
             let hw = engine?.inputNode.inputFormat(forBus: 0)
             if Self.isBenignConfigurationChange(
                 isRunning: engine?.isRunning ?? false,
@@ -187,36 +263,52 @@ final class AudioCapture {
         do {
             try engine.start()
         } catch {
-            // audioEngine is never set on this path, so stopRecording() can't
-            // clean up: drop the observer and tap here or they leak per failure.
-            if let configObserver {
-                NotificationCenter.default.removeObserver(configObserver)
-                self.configObserver = nil
-            }
-            inputNode.removeTap(onBus: 0)
+            Self.teardown(engine: engine, observer: observer)
             throw error
         }
-        self.audioEngine = engine
-        fputs("[AudioCapture] Recording started\n", stderr)
+
+        // Publish the engine — unless this start was abandoned (timed out) or
+        // superseded while it was stuck, in which case shut it down right here.
+        bufferLock.lock()
+        let stillCurrent = sessionGeneration == generation
+        if stillCurrent {
+            activeEngine = engine
+            activeObserver = observer
+        }
+        bufferLock.unlock()
+        if !stillCurrent {
+            fputs("[AudioCapture] Late start from an abandoned session — shutting it down\n", stderr)
+            Self.teardown(engine: engine, observer: observer)
+        }
     }
 
-    /// Stops capture and returns the captured buffer.
+    /// Remove the observer and tap, stop the engine. Worker only (may block).
+    private static func teardown(engine: AVAudioEngine, observer: NSObjectProtocol?) {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+    }
+
+    /// Stops capture and returns the captured buffer. Never blocks on CoreAudio:
+    /// the session is closed under the lock (late tap buffers are dropped by the
+    /// generation check) and the engine teardown is queued on the worker.
     /// - Parameter trimTrailingSeconds: optional number of seconds to trim from the END of the
     ///   buffer. Used by toggle hotkey mode to discard the silent hold-to-stop interval, which
     ///   would otherwise be transcribed by Whisper as hallucinated punctuation/filler.
     func stopRecording(trimTrailingSeconds: TimeInterval = 0) -> [Float] {
-        if let configObserver {
-            NotificationCenter.default.removeObserver(configObserver)
-            self.configObserver = nil
-        }
-        audioEngine?.inputNode.removeTap(onBus: 0)
-        audioEngine?.stop()
-        audioEngine = nil
-
         bufferLock.lock()
+        sessionGeneration += 1
+        let engine = activeEngine
+        let observer = activeObserver
+        activeEngine = nil
+        activeObserver = nil
         var buffer = audioBuffer
         audioBuffer.removeAll()
         bufferLock.unlock()
+
+        if let engine {
+            worker.async { Self.teardown(engine: engine, observer: observer) }
+        }
 
         if trimTrailingSeconds > 0 {
             let samplesToTrim = Int(trimTrailingSeconds * Self.sampleRate)
@@ -232,15 +324,23 @@ final class AudioCapture {
         return buffer
     }
 
+    /// True while a started session is open (between a successful start and stop).
     var isRecording: Bool {
-        audioEngine?.isRunning ?? false
+        bufferLock.lock(); defer { bufferLock.unlock() }
+        return activeEngine != nil
     }
 }
 
 enum AudioCaptureError: LocalizedError {
     case invalidFormat
+    case audioSystemNotResponding
 
     var errorDescription: String? {
-        "Audio input format is invalid."
+        switch self {
+        case .invalidFormat:
+            return "Audio input format is invalid."
+        case .audioSystemNotResponding:
+            return "The microphone didn’t start (macOS audio didn’t respond). Try again."
+        }
     }
 }
